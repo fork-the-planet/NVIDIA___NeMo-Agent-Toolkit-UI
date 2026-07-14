@@ -10,7 +10,11 @@ import {
 import toast from 'react-hot-toast';
 import { v4 as uuidv4 } from 'uuid';
 
-import { webSocketMessageTypes } from '@/utils/app/const';
+import {
+  webSocketMessageTypes,
+  getOAuthMode,
+  buildOAuthModePreferenceMessage,
+} from '@/utils/app/const';
 import {
   saveConversation,
   saveConversations,
@@ -38,6 +42,7 @@ import {
   isSystemIntermediateMessage,
   isSystemInteractionMessage,
   isOAuthConsentMessage,
+  isUserAuthErrorMessage,
   isErrorMessage,
   isSystemResponseComplete,
   isObservabilityTraceMessage,
@@ -230,6 +235,7 @@ export const Chat = () => {
   const [interactionMessage, setInteractionMessage] = useState(null);
   const webSocketRef = useRef<WebSocket | null>(null);
   const webSocketConnectedRef = useRef(false);
+  const oauthPopupCancelledRef = useRef(false);
   const webSocketModeRef = useRef(
     sessionStorage.getItem('webSocketMode') === 'false' ? false : webSocketMode,
   );
@@ -337,8 +343,37 @@ export const Chat = () => {
     }
   }, [selectedConversation?.id]);
 
+  // Detect on page load whether we just returned from an OAuth redirect that wasn't completed.
+  // Must run before the WS toggle effect so the cancel guard is in place before connectWebSocket.
+  // This is the only reliable guard for preflight auth, where no user message is pending so
+  // oauth_pending_message is never saved and the resume effect returns early.
   useEffect(() => {
-    if (webSocketMode && !webSocketConnectedRef.current) {
+    // Read the in-flight-redirect marker: 'true' means this page load is a return from a redirect
+    // login. Clear it immediately so this detection runs exactly once per redirect round-trip.
+    const redirectInitiated = sessionStorage.getItem('oauth_redirect_initiated') === 'true';
+    if (!redirectInitiated) return;
+    sessionStorage.removeItem('oauth_redirect_initiated');
+    const urlParams = new URLSearchParams(window.location.search);
+    if (!urlParams.get('oauth_auth_completed')) {
+      // Returned without the completion flag => the user abandoned the login. Set the cancel guard
+      // so the auto-reconnect effect doesn't immediately re-trigger preflight and loop.
+      sessionStorage.setItem('oauth_redirect_cancelled', 'true');
+      // Preflight cancellation leaves the socket closed with no message to annotate, so the
+      // user would otherwise get no feedback. (When a message is pending, the resume effect
+      // shows an in-chat cancellation message instead, so don't double up.)
+      if (!sessionStorage.getItem('oauth_pending_message')) {
+        toast.error('Authorization cancelled. Send a message to sign in and try again.');
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    // Don't auto-reconnect right after a cancelled redirect login: a fresh connection would
+    // re-run preflight auth and bounce the user back to the login page in a loop. The guard is
+    // cleared when the user explicitly sends a message (handleSend).
+    const redirectAuthCancelled =
+      sessionStorage.getItem('oauth_redirect_cancelled') === 'true';
+    if (webSocketMode && !webSocketConnectedRef.current && !redirectAuthCancelled) {
       connectWebSocket();
     } else {
       // todo cancel ongoing connection attempts
@@ -472,6 +507,12 @@ export const Chat = () => {
         homeDispatch({ field: 'webSocketConnected', value: true });
         webSocketRef.current = ws;
 
+        // Declare the OAuth presentation mode up front, on connect, so the server
+        // has it before any auth flow starts. In redirect mode the consent prompt
+        // navigates this tab away via window.location.href, which can drop a
+        // just-queued WebSocket frame; sending on open avoids that race.
+        ws.send(JSON.stringify(buildOAuthModePreferenceMessage()));
+
         // Restore activeUserMessageId from sessionStorage on reconnect
         const conversationId = selectedConversationRef.current?.id;
         if (conversationId) {
@@ -546,6 +587,60 @@ export const Chat = () => {
       };
     }
   }, [intermediateStepOverride]);
+
+  // Same-tab redirect login reloads the page, so the message that triggered auth must survive the
+  // navigation to be resubmitted on return. See the inline comments at each oauth_* sessionStorage
+  // site for the full key lifecycle.
+  const persistOAuthPendingMessage = () => {
+    const conversation = selectedConversationRef.current;
+    if (!conversation) return;
+    const lastUserMessage = fetchLastMessage({ messages: conversation.messages, role: 'user' });
+    if (!lastUserMessage) return;
+    // Persist the message (and its conversation) that triggered auth so the resume effect can
+    // resubmit it after the redirect navigates the tab away and back. Cleared once resubmitted.
+    sessionStorage.setItem('oauth_pending_message', JSON.stringify(lastUserMessage));
+    sessionStorage.setItem('oauth_pending_conversation_id', conversation.id);
+  };
+
+  /**
+   * Handles OAuth consent flow by opening a popup window or navigating in the same tab
+   */
+  const openOAuthConsentUrl = (message: WebSocketInbound, oauthUrl: string) => {
+    if (!isOAuthConsentMessage(message)) return;
+
+    const shouldUsePopup = getOAuthMode() === 'popup';
+    if (shouldUsePopup) {
+      if (oauthPopupCancelledRef.current) return;
+      // Omit noopener/noreferrer: they force window.open to return null, which would
+      // leave us unable to close the popup once auth completes.
+      const popup = window.open(
+        oauthUrl,
+        'oauth-popup',
+        'width=600,height=700,scrollbars=yes,resizable=yes'
+      );
+      // Only trust messages from our own popup. The cancel page is posted from the NAT
+      // server origin (distinct from both this app and the IdP that oauthUrl points to)
+      // with targetOrigin '*', so an origin check can't be used; identity of the source
+      // window is the correct trust boundary and survives the popup's cross-origin hops.
+      const handleOAuthComplete = (event: MessageEvent) => {
+        if (event.source !== popup) return;
+        if (popup && !popup.closed) popup.close();
+        window.removeEventListener('message', handleOAuthComplete);
+        if (event.data?.type === 'AUTH_CANCELLED') {
+          oauthPopupCancelledRef.current = true;
+        }
+      };
+      window.addEventListener('message', handleOAuthComplete);
+    } else {
+      // Don't re-initiate a redirect the user just cancelled (see the reconnect guard).
+      if (sessionStorage.getItem('oauth_redirect_cancelled') === 'true') return;
+      persistOAuthPendingMessage();
+      // Mark that a redirect is in flight so we can detect cancellation on reload even
+      // when preflight auth fires before any user message exists (no pending message saved).
+      sessionStorage.setItem('oauth_redirect_initiated', 'true');
+      window.location.href = oauthUrl;
+    }
+  };
 
   /**
    * Updates refs immediately before React dispatch to prevent stale reads
@@ -726,7 +821,7 @@ export const Chat = () => {
       const oauthUrl = extractOAuthUrl(message);
       if (oauthUrl) {
         if (isValidConsentPromptURL(oauthUrl)) {
-          window.open(oauthUrl, '_blank', 'noopener,noreferrer');
+          openOAuthConsentUrl(message, oauthUrl);
         } else {
           console.error(
             'OAuth URL validation failed, refusing to open potentially malicious URL:',
@@ -741,6 +836,16 @@ export const Chat = () => {
         );
         toast.error('OAuth URL not found in message content');
       }
+      return;
+    }
+    // Auth was cancelled or failed (bare Error payload, no type/conversation_id).
+    // Stop the in-flight request instead of surfacing a raw validation error.
+    if (isUserAuthErrorMessage(message)) {
+      console.warn('Authentication error received over WebSocket:', message);
+      homeDispatch({ field: 'loading', value: false });
+      homeDispatch({ field: 'messageIsStreaming', value: false });
+      activeUserMessageId.current = null;
+      toast.error(message?.message || 'Authentication failed or was cancelled.');
       return;
     }
     try {
@@ -857,6 +962,9 @@ export const Chat = () => {
   const handleSend = useCallback(
     async (message: Message, deleteCount = 0, _retry = false) => {
       message.id = uuidv4();
+      oauthPopupCancelledRef.current = false;
+      // Explicit user action clears the redirect-cancellation guard so auth can run again.
+      sessionStorage.removeItem('oauth_redirect_cancelled');
 
       // Set the active user message ID for WebSocket message tracking
       activeUserMessageId.current = message.id;
@@ -1481,6 +1589,72 @@ export const Chat = () => {
     },
     [handleSend],
   );
+
+  // After returning from the OAuth provider, resubmit the message that triggered auth.
+  useEffect(() => {
+    const pendingMessageRaw = sessionStorage.getItem('oauth_pending_message');
+    const pendingConversationId = sessionStorage.getItem('oauth_pending_conversation_id');
+    if (!pendingMessageRaw || !pendingConversationId) return;
+    if (!selectedConversation || selectedConversation.id !== pendingConversationId) return;
+
+    // The success page runs at the NAT server origin, so sessionStorage is cross-origin and
+    // unavailable here. The flag is instead passed back as a URL query parameter.
+    const urlParams = new URLSearchParams(window.location.search);
+    const authCompleted = urlParams.get('oauth_auth_completed');
+    if (authCompleted) {
+      urlParams.delete('oauth_auth_completed');
+      const cleanUrl = window.location.pathname + (urlParams.toString() ? '?' + urlParams.toString() : '');
+      window.history.replaceState({}, '', cleanUrl);
+    }
+
+    // Consume the pending-message keys now that this return has been handled (whether auth
+    // completed or was cancelled) so they don't replay on a later, unrelated page load.
+    sessionStorage.removeItem('oauth_pending_message');
+    sessionStorage.removeItem('oauth_pending_conversation_id');
+
+    // If the user pressed back without completing OAuth, show a cancellation message.
+    if (!authCompleted) {
+      // Suppress automatic re-prompting until the user explicitly acts again. Without this,
+      // preflight + redirect auth loops: cancel -> reload -> preflight -> redirect -> cancel...
+      sessionStorage.setItem('oauth_redirect_cancelled', 'true');
+      const conversation = selectedConversationRef.current;
+      if (conversation) {
+        const messages = conversation.messages;
+        const lastMessage = messages.at(-1);
+        const updatedMessages = lastMessage?.role === 'assistant'
+          ? messages.map((m, idx) =>
+              idx === messages.length - 1 ? updateAssistantMessage(m, 'Authorization cancelled.') : m
+            )
+          : [...messages, createAssistantMessage(undefined, undefined, 'Authorization cancelled.')];
+        const updatedConversation = { ...conversation, messages: updatedMessages };
+        const updatedConversations = conversationsRef.current.map(c =>
+          c.id === updatedConversation.id ? updatedConversation : c
+        );
+        updateRefsAndDispatch(updatedConversations, updatedConversation, conversation);
+      }
+      return;
+    }
+
+    const resume = async () => {
+      let pendingMessage: Message;
+      try {
+        pendingMessage = JSON.parse(pendingMessageRaw);
+      } catch {
+        return;
+      }
+      // Ensure the WebSocket is connected before calling handleSend
+      if (webSocketModeRef.current && !webSocketConnectedRef.current) {
+        await connectWebSocket();
+      }
+      // Delete the user message that triggered auth, plus the assistant bubble if one was
+      // created (e.g. by intermediate steps before consent). Preflight auth has no assistant
+      // bubble, so deleting 2 unconditionally would clobber the previous turn's reply.
+      const lastIsAssistant =
+        selectedConversationRef.current?.messages.at(-1)?.role === 'assistant';
+      handleSend(pendingMessage, lastIsAssistant ? 2 : 1);
+    };
+    resume();
+  }, [selectedConversation?.id]);
 
   // Add a new effect to handle streaming state changes
   useEffect(() => {

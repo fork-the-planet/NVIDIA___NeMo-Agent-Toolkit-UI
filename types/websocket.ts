@@ -74,6 +74,15 @@ export type WebSocketInbound =
   | ObservabilityTraceMessage
   | ErrorMessage;
 
+// Outbound: UI-declared OAuth presentation preference (not a credential).
+export interface OAuthModePreferenceMessage {
+  type: 'auth_message';
+  payload: {
+    method: 'oauth_mode_preference';
+    mode: 'redirect' | 'popup';
+  };
+}
+
 // Intermediate step structure
 export interface IntermediateStep {
   id?: string;
@@ -132,6 +141,16 @@ export function isOAuthConsentMessage(
     isSystemInteractionMessage(message) &&
     message.content?.input_type === 'oauth_consent'
   );
+}
+
+/**
+ * Detects a bare auth-error payload sent when (pre-flight) authentication fails
+ * or is cancelled. These arrive as a plain `Error` object (`{ code, message,
+ * details }`) with no `type`/`conversation_id`, so they must be handled before
+ * structural validation rejects them.
+ */
+export function isUserAuthErrorMessage(message: any): boolean {
+  return message?.code === 'user_auth_error';
 }
 
 /**

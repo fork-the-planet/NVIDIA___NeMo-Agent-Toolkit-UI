@@ -14,6 +14,7 @@ import {
 import { InteractionModal } from '@/components/Chat/ChatInteractionMessage';
 import MockWebSocket from '@/__mocks__/websocket';
 import { SESSION_COOKIE_NAME } from '@/constants';
+import { buildOAuthModePreferenceMessage } from '@/utils/app/const';
 
 // Mock react-hot-toast for notification tests
 jest.mock('react-hot-toast', () => ({
@@ -205,6 +206,54 @@ describe('WebSocket Functionality', () => {
       expect(ws.url).toBe(wsUrl);
       expect(ws.url).toContain('session=');
       expect(ws.url).toContain(encodeURIComponent(sessionId));
+    });
+  });
+
+  describe('OAuth Mode Preference frame', () => {
+    // buildOAuthModePreferenceMessage is the EXACT symbol Chat.tsx's ws.onopen
+    // serializes and sends on connect (ws.send(JSON.stringify(buildOAuthModePreferenceMessage()))),
+    // so asserting its shape here guards the real frame the server receives.
+    const originalMode = process.env.NEXT_PUBLIC_NAT_OAUTH_MODE;
+
+    afterEach(() => {
+      if (originalMode === undefined) {
+        delete process.env.NEXT_PUBLIC_NAT_OAUTH_MODE;
+      } else {
+        process.env.NEXT_PUBLIC_NAT_OAUTH_MODE = originalMode;
+      }
+    });
+
+    it('builds the redirect-mode frame by default', () => {
+      delete process.env.NEXT_PUBLIC_NAT_OAUTH_MODE;
+
+      expect(buildOAuthModePreferenceMessage()).toEqual({
+        type: 'auth_message',
+        payload: { method: 'oauth_mode_preference', mode: 'redirect' },
+      });
+    });
+
+    it('builds the popup-mode frame when NEXT_PUBLIC_NAT_OAUTH_MODE is popup', () => {
+      process.env.NEXT_PUBLIC_NAT_OAUTH_MODE = 'popup';
+
+      expect(buildOAuthModePreferenceMessage()).toEqual({
+        type: 'auth_message',
+        payload: { method: 'oauth_mode_preference', mode: 'popup' },
+      });
+    });
+
+    it('is sent verbatim over the socket the way Chat.tsx sends it on open', () => {
+      // Reproduce Chat.tsx:onopen exactly — serialize the shared helper and send it.
+      const ws = new MockWebSocket('ws://test.com/websocket');
+      ws.send = jest.fn();
+
+      ws.send(JSON.stringify(buildOAuthModePreferenceMessage()));
+
+      expect(ws.send).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: 'auth_message',
+          payload: { method: 'oauth_mode_preference', mode: 'redirect' },
+        }),
+      );
     });
   });
 
